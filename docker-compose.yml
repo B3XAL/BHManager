@@ -1,0 +1,16 @@
+services:
+  bhce-manager:
+    build: .
+    container_name: bhce-manager
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8501:8501"
+    volumes:
+      # Mount Docker socket to control host Docker
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Persistent storage for instances
+      - ./instances:/bhce-instances
+    environment:
+      - PYTHONUNBUFFERED=1
+    # Run as root to access Docker socket (or use docker group, see README)
+    user: root
