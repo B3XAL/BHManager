@@ -30,6 +30,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # App
 COPY app.py .
+COPY update.sh .
+RUN chmod +x update.sh
 
 # Instances directory
 RUN mkdir -p /bhce-instances
