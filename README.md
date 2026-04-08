@@ -7,6 +7,7 @@
   <img src="https://img.shields.io/badge/Streamlit-1.35-FF4B4B?style=flat-square&logo=streamlit&logoColor=white" alt="Streamlit"/>
   <img src="https://img.shields.io/badge/Docker-required-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker"/>
   <img src="https://img.shields.io/badge/BloodHound-CE-red?style=flat-square" alt="BloodHound CE"/>
+  <img src="https://img.shields.io/badge/version-v1.2-brightgreen?style=flat-square" alt="Version"/>
 </p>
 
 <p align="center">
@@ -36,6 +37,7 @@ When running multiple red team or pentesting engagements in parallel, you need *
 - 📊 See all instances at a glance with live status
 - ⚙️ Start / Stop / Restart / Reset password with one click
 - 📋 View real-time container logs with color highlighting
+- 📦 Export any instance to a `.tar` and import it on another machine — data, credentials and all
 - 🗑  Delete instances and all their data (with double confirmation)
 
 ---
@@ -92,7 +94,29 @@ Instances live in `./instances/` and **survive manager restarts**.
 | **New Instance** | Automated deploy with free-port verification, live log output |
 | **Manage** | Start / Stop / Restart / Reset password / Delete |
 | **Logs** | Color-coded log viewer (ERROR / WARN / INFO), auto-refresh |
+| **Import / Export** | Backup and restore full instances across machines (see below) |
 | **Settings** | System diagnostics, tool versions, Docker info |
+
+### Import / Export
+
+Move a complete BloodHound instance (data + credentials + config) between machines with a single `.tar` file.
+
+**Export**
+1. Select the client instance
+2. Choose export mode:
+   - **Without images** *(recommended)* — volumes + config only. Images are pulled from Docker Hub automatically on import. Typical size: 50 MB – 2 GB depending on the AD dataset.
+   - **With images** — fully self-contained, no internet needed on the target machine. Typical size: 3–8 GB.
+3. The instance is briefly stopped for data consistency, then automatically restarted.
+4. Download the resulting `<client>_bhce_export.tar`.
+
+**Import**
+1. Upload the `.tar` — the UI shows a preview with instance name, export date and original ports.
+2. Ports are reused if free on the new machine, otherwise new ones are auto-assigned.
+3. Docker images are loaded (if included) or pulled, volumes are restored, and the instance starts automatically.
+
+> The upload limit is set to **2 GB** by default. To raise it, change `STREAMLIT_SERVER_MAX_UPLOAD_SIZE` in `docker-compose.yml`.
+
+---
 
 ### Instance creation flow
 
@@ -122,7 +146,7 @@ BHManager/
     └── <client>/
         ├── docker-compose.yml
         ├── bloodhound.config.json
-        └── .bhce_meta      ← ports + password
+        └── .bhce_meta      ← ports + password + email
 ```
 
 ---

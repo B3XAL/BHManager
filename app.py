@@ -7,6 +7,9 @@ import time
 import json
 import random
 import socket
+import shutil
+import tarfile
+import io
 import urllib.request
 from pathlib import Path
 
@@ -19,7 +22,7 @@ st.set_page_config(
 )
 
 BASE_DIR = "/bhce-instances"
-VERSION = "v1.1"
+VERSION = "v1.2"
 GITHUB_REPO = "B3XAL/BHManager"
 
 # ===== CSS =====
@@ -263,7 +266,7 @@ with st.sidebar:
 
     page = st.radio(
         "Navigation",
-        ["Dashboard", "New Instance", "Manage", "Logs", "Settings"],
+        ["Dashboard", "New Instance", "Manage", "Logs", "Import / Export", "Settings"],
         label_visibility="collapsed"
     )
 
@@ -680,7 +683,6 @@ elif page == "Manage":
                             subprocess.run(["docker", "volume", "rm", v], capture_output=True)
                         for net in [f"bhce_{inst['name']}_default", f"bhce_{inst['name']}_net"]:
                             subprocess.run(["docker", "network", "rm", net], capture_output=True)
-                        import shutil
                         shutil.rmtree(inst["path"], ignore_errors=True)
                         st.success(f"Instance {inst['name']} deleted.")
                     st.session_state.pop("delete_confirm", None)
@@ -737,6 +739,386 @@ elif page == "Logs":
         if auto_refresh:
             time.sleep(5)
             st.rerun()
+
+
+# ---- IMPORT / EXPORT ----
+elif page == "Import / Export":
+    st.markdown('<div class="page-title">📦 Import / Export</div>', unsafe_allow_html=True)
+    st.markdown('<div class="page-subtitle">// backup and restore full bloodhound ce instances</div>', unsafe_allow_html=True)
+
+    tab_exp, tab_imp = st.tabs(["📤 Export", "📥 Import"])
+
+    # ======= EXPORT =======
+    with tab_exp:
+        instances = get_instances()
+        if not instances:
+            st.info("No instances to export. Create one first.")
+        else:
+            st.markdown("""<div class="bhce-card">
+                <div style="color:#ff4d4d; font-weight:700; text-transform:uppercase; letter-spacing:0.1em; margin-bottom:0.5rem;">Export Instance</div>
+                <div style="color:#8b949e; font-size:0.9rem; line-height:1.8;">
+                    Creates a <code>.tar</code> containing volumes (all data) and config files.<br>
+                    The instance is briefly stopped during export for data consistency, then restarted.<br>
+                    Optionally include Docker images for a fully offline import (significantly larger file).
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+            inst_names = [i["name"] for i in instances]
+            export_sel = st.selectbox("Select instance to export", inst_names, key="export_select")
+            include_images = st.checkbox("Include Docker images (offline import, large file)", value=False)
+            if include_images:
+                st.markdown('<div style="color:#8b949e; font-size:0.8rem; margin-top:-0.5rem; margin-bottom:0.5rem; padding-left:1.5rem;">Includes BloodHound, Neo4j and PostgreSQL images inside the .tar. No internet needed on import. Expect a <strong style="color:#c9d1d9;">3–8 GB</strong> file.</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div style="color:#8b949e; font-size:0.8rem; margin-top:-0.5rem; margin-bottom:0.5rem; padding-left:1.5rem;">Only data and config. Images will be pulled from Docker Hub automatically on import. Typical size: <strong style="color:#c9d1d9;">50 MB – 2 GB</strong>.</div>', unsafe_allow_html=True)
+            inst_exp = next(i for i in instances if i["name"] == export_sel)
+
+            if st.button("📦 Export Instance", use_container_width=True):
+                exp_ph = st.empty()
+                exp_lines = []
+
+                def exp_log(msg, color="#c9d1d9"):
+                    exp_lines.append(f'<span style="color:{color};">{msg}</span>')
+                    exp_ph.markdown(
+                        f'<div class="terminal">{"<br>".join(exp_lines)}</div>',
+                        unsafe_allow_html=True
+                    )
+
+                name = inst_exp["name"]
+                export_tmp = Path("/tmp") / f"bhce_export_{name}"
+                final_tar = Path("/tmp") / f"{name}_bhce_export.tar"
+                was_running = inst_exp["running"]
+                export_ok = False
+
+                with st.spinner("Exporting..."):
+                    try:
+                        # Clean previous temp dir
+                        shutil.rmtree(str(export_tmp), ignore_errors=True)
+                        export_tmp.mkdir(parents=True)
+                        (export_tmp / "volumes").mkdir()
+
+                        # Stop instance for consistent snapshot
+                        if was_running:
+                            exp_log("[+] Stopping instance for consistent snapshot...", "#58a6ff")
+                            run_docker_compose(name, inst_exp["path"], "stop")
+                            exp_log("[✔] Instance stopped", "#3fb950")
+
+                        # Copy config files
+                        exp_log("[+] Copying config files...", "#58a6ff")
+                        for fname in [".bhce_meta", "docker-compose.yml", "bloodhound.config.json"]:
+                            src = Path(inst_exp["path"]) / fname
+                            if src.exists():
+                                shutil.copy2(str(src), str(export_tmp / fname))
+                        exp_log("[✔] Config files copied", "#3fb950")
+
+                        # Write export metadata
+                        export_meta = {
+                            "bhmanager_version": VERSION,
+                            "instance_name": name,
+                            "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "original_ports": {
+                                "bloodhound": inst_exp["port"],
+                                "neo4j_http": inst_exp["neo4j_http"],
+                                "neo4j_bolt": inst_exp["neo4j_bolt"],
+                            }
+                        }
+                        (export_tmp / "export_meta.json").write_text(json.dumps(export_meta, indent=2))
+
+                        # Export volumes via pipe (avoids bind-mount host path issues)
+                        exp_log("[+] Discovering volumes...", "#58a6ff")
+                        r = subprocess.run(
+                            ["docker", "volume", "ls", "-q", "--filter", f"name=bhce_{name}"],
+                            capture_output=True, text=True
+                        )
+                        volumes = [v.strip() for v in r.stdout.strip().splitlines() if v.strip()]
+
+                        if volumes:
+                            for vol in volumes:
+                                exp_log(f"[+] Exporting volume: {vol}", "#58a6ff")
+                                vol_out = export_tmp / "volumes" / f"{vol}.tar.gz"
+                                with open(str(vol_out), "wb") as vf:
+                                    r_vol = subprocess.run(
+                                        ["docker", "run", "--rm",
+                                         "-v", f"{vol}:/data:ro",
+                                         "alpine", "tar", "-czC", "/data", "."],
+                                        stdout=vf, stderr=subprocess.PIPE
+                                    )
+                                if r_vol.returncode == 0:
+                                    size_mb = vol_out.stat().st_size / 1024 / 1024
+                                    exp_log(f"[✔] {vol} ({size_mb:.1f} MB)", "#3fb950")
+                                else:
+                                    exp_log(f"[!] Volume warning ({vol}): {r_vol.stderr.decode()[:150]}", "#d29922")
+                        else:
+                            exp_log("[!] No volumes found for this instance.", "#d29922")
+
+                        # Optional: save Docker images
+                        if include_images:
+                            exp_log("[+] Finding container images...", "#58a6ff")
+                            r = subprocess.run(
+                                ["docker", "ps", "-a", "--filter", f"name=bhce_{name}",
+                                 "--format", "{{.Image}}"],
+                                capture_output=True, text=True
+                            )
+                            images = list(set(l.strip() for l in r.stdout.strip().splitlines() if l.strip()))
+                            if not images:
+                                # Try with stopped containers
+                                r2 = subprocess.run(
+                                    ["docker", "compose", "-p", f"bhce_{name}", "images", "--quiet"],
+                                    capture_output=True, text=True, cwd=inst_exp["path"]
+                                )
+                                img_ids = [l.strip() for l in r2.stdout.strip().splitlines() if l.strip()]
+                                images = img_ids
+
+                            if images:
+                                exp_log(f"[+] Saving {len(images)} image(s) — this may take a while...", "#58a6ff")
+                                img_out = str(export_tmp / "images.tar")
+                                with open(img_out, "wb") as imgf:
+                                    r_img = subprocess.run(
+                                        ["docker", "save"] + images,
+                                        stdout=imgf, stderr=subprocess.PIPE
+                                    )
+                                if r_img.returncode == 0:
+                                    size_mb = Path(img_out).stat().st_size / 1024 / 1024
+                                    exp_log(f"[✔] Images saved ({size_mb:.0f} MB)", "#3fb950")
+                                else:
+                                    exp_log(f"[!] Image save warning: {r_img.stderr.decode()[:200]}", "#d29922")
+                            else:
+                                exp_log("[!] Could not find images — skipping.", "#d29922")
+
+                        # Package everything into a single tar
+                        exp_log("[+] Packaging archive...", "#58a6ff")
+                        if final_tar.exists():
+                            final_tar.unlink()
+                        with tarfile.open(str(final_tar), "w") as arch:
+                            # export_meta.json first (for fast preview on import)
+                            arch.add(str(export_tmp / "export_meta.json"), arcname="export_meta.json")
+                            for item in export_tmp.iterdir():
+                                if item.name != "export_meta.json":
+                                    arch.add(str(item), arcname=item.name, recursive=True)
+                        size_mb = final_tar.stat().st_size / 1024 / 1024
+                        exp_log(f"[✔] Archive ready: {final_tar.name} ({size_mb:.1f} MB)", "#3fb950")
+                        export_ok = True
+
+                    except Exception as e:
+                        exp_log(f"[!] Export error: {e}", "#f85149")
+                        st.error(f"Export failed: {e}")
+                    finally:
+                        if was_running:
+                            exp_log("[+] Restarting instance...", "#58a6ff")
+                            run_docker_compose(name, inst_exp["path"], "up", "-d")
+                            exp_log("[✔] Instance restarted", "#3fb950")
+                        shutil.rmtree(str(export_tmp), ignore_errors=True)
+
+                if export_ok and final_tar.exists():
+                    st.success(f"Export ready: **{final_tar.name}**")
+                    with open(str(final_tar), "rb") as dlf:
+                        st.download_button(
+                            label=f"⬇ Download {final_tar.name}",
+                            data=dlf,
+                            file_name=final_tar.name,
+                            mime="application/x-tar",
+                            use_container_width=True,
+                        )
+
+    # ======= IMPORT =======
+    with tab_imp:
+        st.markdown("""<div class="bhce-card">
+            <div style="color:#ff4d4d; font-weight:700; text-transform:uppercase; letter-spacing:0.1em; margin-bottom:0.5rem;">Import Instance</div>
+            <div style="color:#8b949e; font-size:0.9rem; line-height:1.8;">
+                Upload a <code>.tar</code> exported by BHManager. Volumes, credentials and config are fully restored.<br>
+                Ports reuse originals if free, otherwise new ones are auto-assigned.<br>
+                If images were not included in the export, they will be pulled from Docker Hub on first start.<br>
+                <span style="color:#3fb950;">Upload limit is already set to 2 GB on this instance.
+                To increase it further, change <code>STREAMLIT_SERVER_MAX_UPLOAD_SIZE</code> in <code>docker-compose.yml</code>.</span>
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+        uploaded = st.file_uploader("Upload export archive (.tar)", type=["tar"], key="import_upload")
+
+        import_name = None
+        if uploaded:
+            # Preview archive metadata without loading the whole file
+            try:
+                with tarfile.open(fileobj=uploaded, mode="r") as arch:
+                    try:
+                        m = arch.getmember("export_meta.json")
+                        raw = arch.extractfile(m).read().decode()
+                        imp_meta = json.loads(raw)
+                        import_name = imp_meta.get("instance_name")
+                        op = imp_meta.get("original_ports", {})
+                        st.markdown(f"""<div class="bhce-card">
+                            <div style="color:#8b949e; font-size:0.75rem; text-transform:uppercase; letter-spacing:0.1em; margin-bottom:0.5rem;">Archive Info</div>
+                            <div style="font-family:'Share Tech Mono',monospace; font-size:0.85rem; line-height:1.8;">
+                            Instance: <span style="color:#58a6ff;">{import_name}</span><br>
+                            Exported: <span style="color:#c9d1d9;">{imp_meta.get('exported_at','?')}</span><br>
+                            BHManager: <span style="color:#c9d1d9;">{imp_meta.get('bhmanager_version','?')}</span><br>
+                            Original ports &rarr; BH:<span style="color:#d29922;">{op.get('bloodhound','?')}</span>
+                            &nbsp;Neo4j-HTTP:<span style="color:#d29922;">{op.get('neo4j_http','?')}</span>
+                            &nbsp;Neo4j-Bolt:<span style="color:#d29922;">{op.get('neo4j_bolt','?')}</span>
+                            </div>
+                        </div>""", unsafe_allow_html=True)
+                    except KeyError:
+                        st.warning("No metadata found in archive — may be invalid or from an older version.")
+            except Exception as e:
+                st.error(f"Could not read archive: {e}")
+            uploaded.seek(0)
+
+        if import_name and st.button("📥 Import Instance", use_container_width=True):
+            imp_ph = st.empty()
+            imp_lines = []
+
+            def imp_log(msg, color="#c9d1d9"):
+                imp_lines.append(f'<span style="color:{color};">{msg}</span>')
+                imp_ph.markdown(
+                    f'<div class="terminal">{"<br>".join(imp_lines)}</div>',
+                    unsafe_allow_html=True
+                )
+
+            with st.spinner("Importing..."):
+                import_tmp = Path("/tmp") / f"bhce_import_{import_name}"
+                try:
+                    shutil.rmtree(str(import_tmp), ignore_errors=True)
+                    import_tmp.mkdir(parents=True)
+
+                    # Extract archive
+                    imp_log("[+] Extracting archive...", "#58a6ff")
+                    archive_bytes = uploaded.read()
+                    with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r") as arch:
+                        arch.extractall(str(import_tmp))
+                    imp_log("[✔] Archive extracted", "#3fb950")
+                    del archive_bytes  # free memory
+
+                    # Read metadata
+                    meta_file = import_tmp / "export_meta.json"
+                    imp_meta = json.loads(meta_file.read_text())
+                    name = imp_meta["instance_name"]
+                    op = imp_meta.get("original_ports", {})
+
+                    # Check for existing instance
+                    inst_path = Path(BASE_DIR) / name
+                    if inst_path.exists():
+                        imp_log(f"[!] Instance '{name}' already exists. Delete it first.", "#f85149")
+                        st.error(f"Instance '{name}' already exists. Delete it first.")
+                    else:
+                        # Load Docker images if present
+                        img_tar = import_tmp / "images.tar"
+                        if img_tar.exists():
+                            imp_log("[+] Loading Docker images — this may take several minutes...", "#58a6ff")
+                            r = subprocess.run(
+                                ["docker", "load", "-i", str(img_tar)],
+                                capture_output=True, text=True
+                            )
+                            if r.returncode == 0:
+                                imp_log("[✔] Docker images loaded", "#3fb950")
+                            else:
+                                imp_log(f"[!] Image load warning: {r.stderr[:200]}", "#d29922")
+                        else:
+                            imp_log("[i] No images in archive — will pull from Docker Hub on start.", "#8b949e")
+
+                        # Create instance directory and restore configs
+                        inst_path.mkdir(parents=True)
+                        for fname in [".bhce_meta", "docker-compose.yml", "bloodhound.config.json"]:
+                            src = import_tmp / fname
+                            if src.exists():
+                                shutil.copy2(str(src), str(inst_path / fname))
+                        imp_log(f"[✔] Config files restored to {inst_path}", "#3fb950")
+
+                        # Assign ports (try originals, fall back to random)
+                        def _port(key):
+                            try:
+                                return int(op.get(key, 0))
+                            except (ValueError, TypeError):
+                                return 0
+
+                        orig_bh = _port("bloodhound")
+                        orig_nh = _port("neo4j_http")
+                        orig_nb = _port("neo4j_bolt")
+
+                        p_bh = orig_bh if orig_bh > 0 and is_port_free(orig_bh) else get_free_port()
+                        p_nh = orig_nh if orig_nh > 0 and is_port_free(orig_nh) else get_free_port()
+                        p_nb = orig_nb if orig_nb > 0 and is_port_free(orig_nb) else get_free_port()
+
+                        if p_bh != orig_bh:
+                            imp_log(f"[!] Port {orig_bh} in use → reassigned to {p_bh}", "#d29922")
+                        if p_nh != orig_nh:
+                            imp_log(f"[!] Port {orig_nh} in use → reassigned to {p_nh}", "#d29922")
+                        if p_nb != orig_nb:
+                            imp_log(f"[!] Port {orig_nb} in use → reassigned to {p_nb}", "#d29922")
+                        imp_log(f"[+] Ports → BH:{p_bh} / Neo4j-HTTP:{p_nh} / Neo4j-Bolt:{p_nb}", "#d29922")
+
+                        # Patch docker-compose.yml
+                        compose_path = str(inst_path / "docker-compose.yml")
+                        subprocess.run(["yq", "-i", "-y", "del(.services[].ports)", compose_path])
+                        subprocess.run(["yq", "-i", "-y",
+                            f'.services["graph-db"].ports = ["127.0.0.1:{p_nh}:7474", "127.0.0.1:{p_nb}:7687"]',
+                            compose_path])
+                        subprocess.run(["yq", "-i", "-y",
+                            f'.services["bloodhound"].ports = ["127.0.0.1:{p_bh}:8080"]',
+                            compose_path])
+                        imp_log("[✔] docker-compose.yml patched", "#3fb950")
+
+                        # Patch bloodhound.config.json
+                        cfg_path = inst_path / "bloodhound.config.json"
+                        if cfg_path.exists():
+                            try:
+                                cfg = json.loads(cfg_path.read_text())
+                                cfg["bind_addr"] = f"0.0.0.0:{p_bh}"
+                                cfg["root_url"] = f"http://127.0.0.1:{p_bh}/"
+                                cfg_path.write_text(json.dumps(cfg, indent=2))
+                                imp_log("[✔] bloodhound.config.json patched", "#3fb950")
+                            except Exception as e:
+                                imp_log(f"[!] Config patch warning: {e}", "#d29922")
+
+                        # Update .bhce_meta with new ports
+                        meta_path = inst_path / ".bhce_meta"
+                        if meta_path.exists():
+                            mc = meta_path.read_text()
+                            mc = re.sub(r'BLOODHOUND_PORT=\S*', f'BLOODHOUND_PORT={p_bh}', mc)
+                            mc = re.sub(r'NEO4J_HTTP_PORT=\S*', f'NEO4J_HTTP_PORT={p_nh}', mc)
+                            mc = re.sub(r'NEO4J_BOLT_PORT=\S*', f'NEO4J_BOLT_PORT={p_nb}', mc)
+                            meta_path.write_text(mc)
+                            imp_log("[✔] Metadata updated", "#3fb950")
+
+                        # Restore volumes via stdin pipe
+                        volumes_dir = import_tmp / "volumes"
+                        if volumes_dir.exists():
+                            imp_log("[+] Restoring volumes...", "#58a6ff")
+                            for vol_archive in sorted(volumes_dir.glob("*.tar.gz")):
+                                vol_name = vol_archive.name[:-7]  # strip .tar.gz
+                                imp_log(f"[+] Restoring volume: {vol_name}", "#58a6ff")
+                                subprocess.run(["docker", "volume", "create", vol_name], capture_output=True)
+                                with open(str(vol_archive), "rb") as vf:
+                                    r_vol = subprocess.run(
+                                        ["docker", "run", "--rm", "-i",
+                                         "-v", f"{vol_name}:/data",
+                                         "alpine", "tar", "-xzC", "/data"],
+                                        stdin=vf, capture_output=True
+                                    )
+                                if r_vol.returncode == 0:
+                                    imp_log(f"[✔] Volume restored: {vol_name}", "#3fb950")
+                                else:
+                                    imp_log(f"[!] Volume warning ({vol_name}): {r_vol.stderr.decode()[:150]}", "#d29922")
+
+                        # Start containers
+                        imp_log("[+] Starting containers...", "#58a6ff")
+                        r = subprocess.run(
+                            ["docker", "compose", "-p", f"bhce_{name}", "up", "-d"],
+                            capture_output=True, text=True, cwd=str(inst_path)
+                        )
+                        if r.returncode == 0:
+                            imp_log("[✔] Containers started!", "#3fb950")
+                            get_instances.clear()
+                            st.success(f"✅ Instance **{name}** imported successfully! BloodHound running on port **{p_bh}**.")
+                        else:
+                            imp_log(f"[!] Start output: {(r.stdout + r.stderr)[:400]}", "#d29922")
+                            st.warning("Import done but containers may not have started cleanly. Check Logs.")
+
+                        imp_log("[✔] Import complete!", "#3fb950")
+
+                except Exception as e:
+                    imp_log(f"[!] Import failed: {e}", "#f85149")
+                    st.error(f"Import failed: {e}")
+                finally:
+                    shutil.rmtree(str(import_tmp), ignore_errors=True)
 
 
 # ---- SETTINGS ----
