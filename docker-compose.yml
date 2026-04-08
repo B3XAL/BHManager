@@ -4,7 +4,7 @@ services:
     container_name: bhce-manager
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8501:8501"
+      - "8501:8501"
     volumes:
       # Mount Docker socket to control host Docker
       - /var/run/docker.sock:/var/run/docker.sock

@@ -22,7 +22,7 @@ st.set_page_config(
 )
 
 BASE_DIR = "/bhce-instances"
-VERSION = "v1.2"
+VERSION = "v1.3"
 GITHUB_REPO = "B3XAL/BHManager"
 
 # ===== CSS =====
@@ -1141,13 +1141,31 @@ elif page == "Settings":
     with col_btn:
         if latest and latest != VERSION:
             if st.button("⬆ Update now", use_container_width=True):
-                with st.spinner("Updating..."):
-                    result = subprocess.run(
-                        ["bash", "/app/update.sh"],
-                        capture_output=True, text=True
-                    )
-                    output = result.stdout + result.stderr
-                if result.returncode == 0:
+                st.info("Update in progress — do not close this tab.")
+                st.components.v1.html("""
+                    <script>
+                    setTimeout(function poll() {
+                        fetch(window.parent.location.origin + '/_stcore/health')
+                            .then(function(r) {
+                                if (r.ok) { window.parent.location.reload(); }
+                                else { setTimeout(poll, 2000); }
+                            })
+                            .catch(function() { setTimeout(poll, 2000); });
+                    }, 12000);
+                    </script>
+                    <div style="color:#58a6ff;font-family:monospace;font-size:13px">
+                        &#x27F3; Page will reload automatically when the update is complete
+                    </div>
+                """, height=30)
+                result = subprocess.run(
+                    ["bash", "/app/update.sh"],
+                    capture_output=True, text=True
+                )
+                output = result.stdout + result.stderr
+                if (result.returncode == 0
+                        or "[✔] Update complete" in output
+                        or "[✔] Container started" in output
+                        or "app-bhce-manager Built" in output):
                     st.success("Update complete — reloading in a moment.")
                     st.code(output)
                     check_latest_version.clear()
